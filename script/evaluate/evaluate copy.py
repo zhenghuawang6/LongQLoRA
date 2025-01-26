@@ -20,15 +20,11 @@ import random
 import numpy as np
 from tqdm import tqdm
 import transformers
-from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM
+
 import sys
-sys.path.append("/data/wangzh/middle_rope/src")
-from utils.lost_in_the_middle.eval_qa_response import evaluate_qa
-from modify_arch.setup_layerwise_new import setup_models_layerwise
-
-# import sys
-# sys.path.append("../../")
-
+sys.path.append("../../")
+from component.utils import ModelUtils
+from attention.llama_attn_replace import replace_llama_attn
 """
 评测base model的ppl
 """
@@ -42,7 +38,7 @@ def parse_config():
     parser.add_argument('--context_size', type=int, default=8192, help='context size during fine-tuning')
     parser.add_argument('--sliding_window', type=int, default=8192, help='context size during fine-tuning')
     parser.add_argument('--peft_model', type=str, default=None, help='')
-    # parser.add_argument('--flash_attn', action="store_true", default=False, help='')
+    parser.add_argument('--flash_attn', action="store_true", default=False, help='')
     parser.add_argument('--load_in_4bit', action="store_true", default=True, help='weather use 4 bit to inference')
     # parser.add_argument('--data_path', type=str, default="../../data/proof-pile-test.bin", help='')
     # parser.add_argument('--data_path', type=str, default="../../data/pg19-test.bin", help='')
@@ -68,32 +64,6 @@ def get_as_batch(data, seq_length, batch_size, device='cpu', sliding_window=256)
 def iceildiv(x, y):
     return (x + y - 1) // y
 
-def calculate_attention_entropy(attention_weights, context_window=None):
-    """
-    计算注意力熵分布。
-    
-    参数：
-        attention_weights (torch.Tensor): 注意力矩阵，形状为 (batch_size, num_heads, seq_len, seq_len)
-        context_window (int): 上下文窗口大小，若为 None 则计算全局熵。
-    
-    返回：
-        entropy_values (torch.Tensor): 注意力熵的分布，形状为 (batch_size, num_heads, seq_len)。
-    """
-    num_layers, batch_size, num_heads, seq_len= attention_weights.size()
-    #移除batch——size
-    attention_weights = attention_weights.squeeze()
-    #聚合head
-    attention_weights = torch.mean(attention_weights,dim=1)
-    #取最后一个token计算
-    print(f"各个layer的注意力总和为{attention_weights.sum(dim=-1)}")
-
-    # attention_weights = attention_weights[:,-1,:].squeeze() #num_layers,seq_len
-    #计算交叉熵
-    result = []
-    for layer_id, attention_score in enumerate(attention_weights):
-        entropy = -torch.sum(attention_score * torch.log(attention_score + 1e-6), dim=-1)
-        result.append(entropy)
-    return torch.stack(result,dim=0)
 
 def evaluate(model, data, batch_size, device, seq_length, sliding_window=256, use_cache=False):
     stats = {}
@@ -102,8 +72,7 @@ def evaluate(model, data, batch_size, device, seq_length, sliding_window=256, us
 
     loss_list_val, acc_list = [], []
     loss_step_list_val = []
-    layer_entropy_result = []
-    count = 0
+
     with torch.no_grad():
         print(f"Using seq length {seq_length}")
         torch.set_printoptions(sci_mode=False)
@@ -113,7 +82,7 @@ def evaluate(model, data, batch_size, device, seq_length, sliding_window=256, us
                         data['val'],
                         seq_length,
                         batch_size,
-                        device="cpu",
+                        device=device,
                         sliding_window=sliding_window
                     )
                 ),
@@ -122,26 +91,17 @@ def evaluate(model, data, batch_size, device, seq_length, sliding_window=256, us
                     batch_size
                 )
         ):
-            count+=1
-            if count == 50:
-                break
             val_loss = 0.
             acc = 0.
             cnt = 0
-            y=y.cuda()
 
             for part_idx, i in enumerate(range(0, x.shape[1], seq_length)):
                 part_len = x[:, i:i + seq_length].shape[1]
 
                 outputs = model(
-                    input_ids=x[:, i:i + seq_length].to("cuda"),
-                    labels=x[:, i:i + seq_length].contiguous().to("cuda"),
-                    use_cache=True,
-                    output_attentions=False)
-                
-                # attention_weights = torch.stack(outputs.attentions, dim=0).cpu()
-                # layers_entropy = calculate_attention_entropy(attention_weights)
-                # layer_entropy_result.append(layers_entropy)
+                    input_ids=x[:, i:i + seq_length],
+                    labels=x[:, i:i + seq_length].contiguous(),
+                    use_cache=use_cache)
 
                 val_loss = outputs.loss * part_len + val_loss
                 acc = ((outputs.logits.argmax(-1) == y[:, i:i + seq_length]).float().sum()) + acc
@@ -155,7 +115,6 @@ def evaluate(model, data, batch_size, device, seq_length, sliding_window=256, us
             loss_list_val.append(val_loss.item())
             acc_list.append(acc.item())
 
-    # stats['layer_entropy'] = torch.stack(layer_entropy_result,dim=0).mean(dim=0)
     stats['val_acc'] = torch.as_tensor(acc_list).mean().item()
     stats['val_loss'] = torch.as_tensor(loss_list_val).mean().item()
     stats['val_perplexity'] = 2.71828 ** stats['val_loss']
@@ -165,7 +124,10 @@ def evaluate(model, data, batch_size, device, seq_length, sliding_window=256, us
 
 
 def main(args):
+    device = "cuda:0"
     seed = 2
+    torch.cuda.set_device(device)
+
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -177,42 +139,27 @@ def main(args):
     print("base model", args.base_model)
     print("peft model", args.peft_model)
 
+    if args.flash_attn:
+        replace_llama_attn(use_flash_attn=True, use_full=True)
 
     # Set RoPE scaling factor
     config = transformers.AutoConfig.from_pretrained(args.base_model)
     context_size = args.context_size if args.context_size > 0 else args.seq_len
+    orig_ctx_len = getattr(config, "max_position_embeddings", None)  # this value should be 4096 for LLaMA2 models
+    if orig_ctx_len and context_size > orig_ctx_len:
+        scaling_factor = float(math.ceil(context_size / orig_ctx_len))
+        config.rope_scaling = {"type": "linear", "factor": scaling_factor}
 
-    # orig_ctx_len = getattr(config, "max_position_embeddings", None)  # this value should be 4096 for LLaMA2 models
-    # if orig_ctx_len and context_size > orig_ctx_len:
-    #     # scaling_factor = float(math.ceil(context_size / orig_ctx_len))
-    #     scaling_factor = context_size / orig_ctx_len
-    #     config.rope_scaling = {"type": "linear", "factor": 1.6148}
-    #     print(f"factor:{scaling_factor}")
-
-
-    # model = AutoModelForCausalLM.from_pretrained(
-    #         args.base_model,
-    #         config=config,
-    #         trust_remote_code=True,
-    #         low_cpu_mem_usage=True,
-    #         torch_dtype=torch.float16,
-    #         device_map='auto',
-    #     )
+    # Load model and tokenizer
+    model = ModelUtils.load_model(
+        args.base_model,
+        config=config,
+        load_in_4bit=args.load_in_4bit,
+        adapter_name_or_path=args.peft_model
+    ).eval()
     # model.resize_token_embeddings(32001)
 
-    #加载按照层以及scale
-    args.model_name = args.base_model
-    args.enable_changed_rope = True
-    args.apply_layers = "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31"
-    config, tokenizer, model = setup_models_layerwise(args)
-    layer_ids = [int(id) for id in args.apply_layers.split(",")]
-    layer_scales = np.array([1.4648, 1.4848000000000001, 1.5048000000000001, 1.5248000000000002, 1.5448, 1.5648, 1.5848, 1.6048, 1.6248, 1.6448, 1.6648, 1.6848, 1.7047999999999999, 1.7247999999999999, 1.7448, 1.7648, 1.7648, 1.7448, 1.7247999999999999, 1.7047999999999999, 1.6848, 1.6648, 1.6448, 1.6248, 1.6048, 1.5848, 1.5648, 1.5448, 1.5248000000000002, 1.5048000000000001, 1.4848000000000001, 1.4648])
-    model.replace_position_embeddings(layer_ids,layer_scales)
-
-
-
-    stats = evaluate(model, data, args.batch_size, None, args.seq_len, sliding_window=args.sliding_window)
-
+    stats = evaluate(model, data, args.batch_size, device, args.seq_len, sliding_window=args.sliding_window)
 
     print(stats)
 
